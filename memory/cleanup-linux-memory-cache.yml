@@ -1,0 +1,139 @@
+---
+- name: Release reclaimable Linux memory caches
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    ansible_port: 36633
+    memory_cleanup_execute: false
+    drop_caches_value: 3
+
+  tasks:
+    - name: Preflight | verify privilege and drop_caches access
+      ansible.builtin.raw: |
+        set -eu
+
+        if [ "$(id -u)" -eq 0 ]; then
+          :
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+          :
+        else
+          echo "FAIL: current user must be root or have passwordless sudo"
+          exit 20
+        fi
+
+        run_as_root() {
+          if [ "$(id -u)" -eq 0 ]; then
+            "$@"
+          else
+            sudo -n "$@"
+          fi
+        }
+
+        if [ ! -w /proc/sys/vm/drop_caches ] && ! run_as_root test -w /proc/sys/vm/drop_caches; then
+          echo "FAIL: cannot write /proc/sys/vm/drop_caches"
+          exit 21
+        fi
+
+        case "{{ drop_caches_value }}" in
+          1|2|3) ;;
+          *)
+            echo "FAIL: drop_caches_value must be 1, 2, or 3"
+            exit 22
+            ;;
+        esac
+
+        echo "OK: privilege and drop_caches checks passed"
+      register: preflight_result
+      changed_when: false
+      failed_when: preflight_result.rc != 0
+
+    - name: Show preflight result
+      ansible.builtin.debug:
+        var: preflight_result.stdout_lines
+
+    - name: Preview | show memory state before cleanup
+      ansible.builtin.raw: |
+        set -eu
+
+        echo "Node: $(hostname)"
+        echo
+        echo "free -h before cleanup:"
+        free -h
+        echo
+        echo "Selected /proc/meminfo values before cleanup:"
+        grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SReclaimable|SUnreclaim|SwapTotal|SwapFree):' /proc/meminfo || true
+        echo
+        echo "drop_caches_value={{ drop_caches_value }}"
+        echo "memory_cleanup_execute={{ memory_cleanup_execute }}"
+      register: preview_result
+      changed_when: false
+      failed_when: preview_result.rc != 0
+
+    - name: Show preview result
+      ansible.builtin.debug:
+        var: preview_result.stdout_lines
+
+    - name: Safety | explain dry-run mode
+      ansible.builtin.raw: |
+        echo "No memory cache cleanup performed."
+        echo "Re-run with -e memory_cleanup_execute=true to run sync and write {{ drop_caches_value }} to /proc/sys/vm/drop_caches."
+      register: safety_result
+      changed_when: false
+      failed_when: false
+      when: not (memory_cleanup_execute | bool)
+
+    - name: Show dry-run message
+      ansible.builtin.debug:
+        var: safety_result.stdout_lines
+      when: not (memory_cleanup_execute | bool)
+
+    - name: Cleanup | release reclaimable Linux caches
+      ansible.builtin.raw: |
+        set -eu
+
+        run_as_root() {
+          if [ "$(id -u)" -eq 0 ]; then
+            "$@"
+          else
+            sudo -n "$@"
+          fi
+        }
+
+        echo "Starting memory cache cleanup on $(hostname)"
+        run_as_root sync
+        if [ "$(id -u)" -eq 0 ]; then
+          echo "{{ drop_caches_value }}" > /proc/sys/vm/drop_caches
+        else
+          printf '%s\n' "{{ drop_caches_value }}" | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
+        fi
+        echo "Completed memory cache cleanup on $(hostname)"
+      register: cleanup_result
+      changed_when: cleanup_result.rc == 0
+      failed_when: cleanup_result.rc != 0
+      when: memory_cleanup_execute | bool
+
+    - name: Show cleanup result
+      ansible.builtin.debug:
+        var: cleanup_result.stdout_lines
+      when: memory_cleanup_execute | bool
+
+    - name: Verify | show memory state after operation
+      ansible.builtin.raw: |
+        set -eu
+
+        echo "Node: $(hostname)"
+        echo
+        echo "free -h after operation:"
+        free -h
+        echo
+        echo "Selected /proc/meminfo values after operation:"
+        grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SReclaimable|SUnreclaim|SwapTotal|SwapFree):' /proc/meminfo || true
+      register: verify_result
+      changed_when: false
+      failed_when: verify_result.rc != 0
+
+    - name: Show verify result
+      ansible.builtin.debug:
+        var: verify_result.stdout_lines

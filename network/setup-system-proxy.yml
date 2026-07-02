@@ -17,6 +17,12 @@
       - 10.0.0.0/8
       - 172.16.0.0/12
       - 192.168.0.0/16
+    proxy_no_proxy_items: >-
+      {{
+        (proxy_no_proxy | split(',') | map('trim') | reject('equalto', '') | list)
+        if proxy_no_proxy is string
+        else proxy_no_proxy
+      }}
 
   tasks:
     - name: Preflight | verify proxy_url is provided
@@ -27,13 +33,13 @@
         fail_msg: "proxy_url is required. Example: -e proxy_url=http://proxy.example:7890"
         success_msg: "proxy_url is provided"
 
-    - name: Preflight | verify proxy_no_proxy is a list
+    - name: Preflight | verify proxy_no_proxy is a string or list
       ansible.builtin.assert:
         that:
-          - proxy_no_proxy is sequence
-          - proxy_no_proxy is not string
-        fail_msg: "proxy_no_proxy must be a YAML list, for example: ['localhost', '127.0.0.1', '::1']"
-        success_msg: "proxy_no_proxy is a list"
+          - proxy_no_proxy is string or (proxy_no_proxy is sequence and proxy_no_proxy is not string)
+          - proxy_no_proxy_items | length > 0
+        fail_msg: "proxy_no_proxy must be a comma-separated string or YAML list. Example string: localhost,127.0.0.1,::1"
+        success_msg: "proxy_no_proxy is valid"
 
     - name: Preview | show proxy profile plan
       ansible.builtin.debug:
@@ -41,7 +47,7 @@
           - "proxy_execute={{ proxy_execute }}"
           - "proxy_profile_path={{ proxy_profile_path }}"
           - "proxy_url={{ proxy_url }}"
-          - "proxy_no_proxy={{ proxy_no_proxy | join(',') }}"
+          - "proxy_no_proxy={{ proxy_no_proxy_items | join(',') }}"
           - "No proxy profile will be written unless proxy_execute=true."
 
     - name: Setup | write system proxy profile

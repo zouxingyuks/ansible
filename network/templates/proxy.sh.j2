@@ -1,0 +1,7 @@
+# Managed by Ansible. Manual changes will be overwritten.
+export http_proxy={{ proxy_url | quote }}
+export https_proxy={{ proxy_url | quote }}
+export HTTP_PROXY={{ proxy_url | quote }}
+export HTTPS_PROXY={{ proxy_url | quote }}
+export no_proxy={{ proxy_no_proxy | join(',') | quote }}
+export NO_PROXY={{ proxy_no_proxy | join(',') | quote }}

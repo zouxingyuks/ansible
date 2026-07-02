@@ -1,0 +1,62 @@
+---
+- name: Setup system HTTP and HTTPS proxy
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    ansible_port: 36633
+    proxy_execute: false
+    proxy_profile_path: /etc/profile.d/proxy.sh
+    proxy_no_proxy:
+      - localhost
+      - 127.0.0.1
+      - ::1
+      - .svc
+      - .cluster.local
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+
+  tasks:
+    - name: Preflight | verify proxy_url is provided
+      ansible.builtin.assert:
+        that:
+          - proxy_url is defined
+          - proxy_url | length > 0
+        fail_msg: "proxy_url is required. Example: -e proxy_url=http://proxy.example:7890"
+        success_msg: "proxy_url is provided"
+
+    - name: Preflight | verify proxy_no_proxy is a list
+      ansible.builtin.assert:
+        that:
+          - proxy_no_proxy is sequence
+          - proxy_no_proxy is not string
+        fail_msg: "proxy_no_proxy must be a YAML list, for example: ['localhost', '127.0.0.1', '::1']"
+        success_msg: "proxy_no_proxy is a list"
+
+    - name: Preview | show proxy profile plan
+      ansible.builtin.debug:
+        msg:
+          - "proxy_execute={{ proxy_execute }}"
+          - "proxy_profile_path={{ proxy_profile_path }}"
+          - "proxy_url={{ proxy_url }}"
+          - "proxy_no_proxy={{ proxy_no_proxy | join(',') }}"
+          - "No proxy profile will be written unless proxy_execute=true."
+
+    - name: Setup | write system proxy profile
+      become: true
+      ansible.builtin.template:
+        src: templates/proxy.sh.j2
+        dest: "{{ proxy_profile_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: proxy_execute | bool
+
+    - name: Verify | show next step
+      ansible.builtin.debug:
+        msg:
+          - "Proxy profile is managed at {{ proxy_profile_path }}."
+          - "Re-login or run 'source /etc/profile' for interactive shells to pick up the proxy."
+      when: proxy_execute | bool

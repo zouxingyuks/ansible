@@ -51,32 +51,16 @@
           - "No proxy profile will be written unless proxy_execute=true."
 
     - name: Setup | write system proxy profile
+      become: true
       ansible.builtin.raw: |
         set -eu
-
-        if [ "$(id -u)" -eq 0 ]; then
-          :
-        elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-          :
-        else
-          echo "FAIL: current user must be root or have passwordless sudo"
-          exit 20
-        fi
-
-        run_as_root() {
-          if [ "$(id -u)" -eq 0 ]; then
-            "$@"
-          else
-            sudo -n "$@"
-          fi
-        }
 
         dest={{ proxy_profile_path | quote }}
         tmp="/tmp/ansible-proxy-profile.$$"
         trap 'rm -f "$tmp"' EXIT HUP INT TERM
 
         parent=$(dirname "$dest")
-        if ! run_as_root test -d "$parent"; then
+        if [ ! -d "$parent" ]; then
           echo "FAIL: parent directory does not exist: $parent"
           exit 21
         fi
@@ -91,14 +75,14 @@
         export NO_PROXY={{ proxy_no_proxy_items | join(',') | quote }}
         PROXY_PROFILE_EOF
 
-        if run_as_root test -f "$dest" && run_as_root cmp -s "$tmp" "$dest"; then
+        if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
           echo "OK: proxy profile already current at $dest"
           exit 0
         fi
 
-        run_as_root tee "$dest" < "$tmp" >/dev/null
-        run_as_root chown root:root "$dest"
-        run_as_root chmod 0644 "$dest"
+        cp "$tmp" "$dest"
+        chown root:root "$dest"
+        chmod 0644 "$dest"
         echo "CHANGED: wrote proxy profile to $dest"
       register: proxy_write_result
       changed_when: "'CHANGED:' in proxy_write_result.stdout"

@@ -6,6 +6,9 @@
 
   vars:
     ansible_port: 36633
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_become_user: root
     proxy_execute: false
     proxy_profile_path: /etc/profile.d/proxy.sh
     proxy_no_proxy:

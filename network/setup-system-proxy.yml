@@ -51,7 +51,7 @@
           - "proxy_profile_path={{ proxy_profile_path }}"
           - "proxy_url={{ proxy_url }}"
           - "proxy_no_proxy={{ proxy_no_proxy_items | join(',') }}"
-          - "No proxy profile will be written unless proxy_execute=true."
+          - "No proxy profile or shell startup files will be written unless proxy_execute=true."
 
     - name: Setup | write system proxy profile
       become: true
@@ -97,9 +97,76 @@
         var: proxy_write_result.stdout_lines
       when: proxy_execute | bool
 
+    - name: Setup | ensure shell startup files source proxy profile
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        begin_marker="# BEGIN ANSIBLE MANAGED SYSTEM PROXY"
+        end_marker="# END ANSIBLE MANAGED SYSTEM PROXY"
+        tmp_dir="/tmp/ansible-proxy-rc.$$"
+        mkdir -p "$tmp_dir"
+        trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+
+        block_file="$tmp_dir/block"
+        cat > "$block_file" <<'PROXY_RC_BLOCK_EOF'
+        # BEGIN ANSIBLE MANAGED SYSTEM PROXY
+        if [ -r {{ proxy_profile_path | quote }} ]; then
+          . {{ proxy_profile_path | quote }}
+        fi
+        # END ANSIBLE MANAGED SYSTEM PROXY
+        PROXY_RC_BLOCK_EOF
+
+        manage_rc_file() {
+          rc_file="$1"
+          rc_name=$(basename "$rc_file")
+
+          if [ ! -f "$rc_file" ]; then
+            echo "SKIP: shell startup file does not exist: $rc_file"
+            return 0
+          fi
+
+          current_file="$tmp_dir/$rc_name.current"
+          stripped_file="$tmp_dir/$rc_name.stripped"
+          candidate_file="$tmp_dir/$rc_name.candidate"
+
+          cp "$rc_file" "$current_file"
+
+          awk -v begin="$begin_marker" -v end="$end_marker" '
+            $0 == begin { skip = 1; next }
+            $0 == end { skip = 0; next }
+            !skip { print }
+          ' "$current_file" > "$stripped_file"
+
+          cat "$stripped_file" "$block_file" > "$candidate_file"
+
+          if [ -f "$rc_file" ] && cmp -s "$candidate_file" "$rc_file"; then
+            echo "OK: shell startup file already sources proxy profile: $rc_file"
+            return 0
+          fi
+
+          cp "$candidate_file" "$rc_file"
+          chown root:root "$rc_file"
+          chmod 0644 "$rc_file"
+          echo "CHANGED: ensured shell startup file sources proxy profile: $rc_file"
+        }
+
+        manage_rc_file /etc/bash.bashrc
+        manage_rc_file /etc/zsh/zshrc
+      register: proxy_rc_result
+      changed_when: "'CHANGED:' in proxy_rc_result.stdout"
+      failed_when: proxy_rc_result.rc != 0
+      when: proxy_execute | bool
+
+    - name: Show shell startup result
+      ansible.builtin.debug:
+        var: proxy_rc_result.stdout_lines
+      when: proxy_execute | bool
+
     - name: Verify | show next step
       ansible.builtin.debug:
         msg:
           - "Proxy profile is managed at {{ proxy_profile_path }}."
-          - "Re-login or run 'source /etc/profile' for interactive shells to pick up the proxy."
+          - "Existing system bash and zsh startup files source {{ proxy_profile_path }} through an Ansible managed block."
+          - "Start a new bash/zsh shell, or source {{ proxy_profile_path }} in the current shell, to pick up the proxy."
       when: proxy_execute | bool

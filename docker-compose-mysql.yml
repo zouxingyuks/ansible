@@ -8,6 +8,7 @@ services:
             SEMAPHORE_DB_HOST: ${SEMAPHORE_DB_HOST:-localhost}
             SEMAPHORE_DB_NAME: ${SEMAPHORE_DB_NAME:-semaphore}
             SEMAPHORE_DB_USER: ${SEMAPHORE_DB_USER:-root}
+            SEMAPHORE_DB_PASS: ${SEMAPHORE_DB_PASS:-changeme}
             SEMAPHORE_ADMIN: ${SEMAPHORE_ADMIN:-admin}
             SEMAPHORE_ADMIN_PASSWORD: ${SEMAPHORE_ADMIN_PASSWORD:-changeme}
             SEMAPHORE_ADMIN_NAME: ${SEMAPHORE_ADMIN_NAME:-Admin}

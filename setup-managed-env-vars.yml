@@ -1,0 +1,457 @@
+---
+- name: Setup managed system environment variables
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    ansible_port: 36633
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_become_user: root
+    managed_env_execute: false
+    managed_env_profile_path: /etc/profile.d/managed-env.sh
+    managed_env_manage_shell_startup: true
+    managed_env_shell_startup_files:
+      - /etc/bash.bashrc
+      - /etc/zsh/zshrc
+    managed_env_single_quote: "'"
+    managed_env_single_quote_escape: "'\\''"
+    managed_env_allowed_shell_startup_files:
+      - /etc/bash.bashrc
+      - /etc/zsh/zshrc
+    managed_env_var_names: "{{ managed_env_vars.keys() | list if managed_env_vars is defined and managed_env_vars is mapping else [] }}"
+    managed_env_invalid_var_names: "{{ managed_env_var_names | reject('match', '^[A-Za-z_][A-Za-z0-9_]*$') | list }}"
+    managed_env_invalid_value_type_names: >-
+      {{
+        managed_env_vars | dict2items
+        | selectattr('value', 'none')
+        | map(attribute='key')
+        | list
+        if managed_env_vars is defined and managed_env_vars is mapping
+        else []
+      }}
+    managed_env_mapping_value_names: >-
+      {{
+        managed_env_vars | dict2items
+        | selectattr('value', 'mapping')
+        | map(attribute='key')
+        | list
+        if managed_env_vars is defined and managed_env_vars is mapping
+        else []
+      }}
+    managed_env_sequence_value_names: >-
+      {{
+        managed_env_vars | dict2items
+        | selectattr('value', 'sequence')
+        | rejectattr('value', 'string')
+        | map(attribute='key')
+        | list
+        if managed_env_vars is defined and managed_env_vars is mapping
+        else []
+      }}
+    managed_env_newline_value_names: >-
+      {{
+        managed_env_vars | dict2items
+        | selectattr('value', 'string')
+        | selectattr('value', 'search', '[\n\r\x00]')
+        | map(attribute='key')
+        | list
+        if managed_env_vars is defined and managed_env_vars is mapping
+        else []
+      }}
+    managed_env_sorted_items: "{{ managed_env_vars | dict2items | sort(attribute='key') if managed_env_vars is defined and managed_env_vars is mapping else [] }}"
+    managed_env_startup_invalid_files: "{{ managed_env_shell_startup_files | difference(managed_env_allowed_shell_startup_files) if managed_env_shell_startup_files is sequence and managed_env_shell_startup_files is not string else [] }}"
+
+  tasks:
+    - name: Preflight | verify managed_env_vars is provided as a mapping
+      ansible.builtin.assert:
+        that:
+          - managed_env_vars is defined
+          - managed_env_vars is mapping
+        fail_msg: "managed_env_vars must be explicitly defined as a mapping. Empty map is allowed: -e '{managed_env_vars: {}}'"
+        success_msg: "managed_env_vars is defined as a mapping"
+
+    - name: Preflight | verify managed environment variable names
+      ansible.builtin.assert:
+        that:
+          - managed_env_invalid_var_names | length == 0
+        fail_msg: "Invalid environment variable names: {{ managed_env_invalid_var_names | join(', ') }}. Names must match ^[A-Za-z_][A-Za-z0-9_]*$"
+        success_msg: "managed_env_vars keys are valid environment variable names"
+
+    - name: Preflight | verify managed environment variable values
+      ansible.builtin.assert:
+        that:
+          - managed_env_invalid_value_type_names | length == 0
+          - managed_env_mapping_value_names | length == 0
+          - managed_env_sequence_value_names | length == 0
+          - managed_env_newline_value_names | length == 0
+        fail_msg: >-
+          managed_env_vars values must be scalar, non-null, and must not contain newline, carriage return, or NUL.
+          null={{ managed_env_invalid_value_type_names | join(', ') }};
+          mappings={{ managed_env_mapping_value_names | join(', ') }};
+          sequences={{ managed_env_sequence_value_names | join(', ') }};
+          newline_or_control={{ managed_env_newline_value_names | join(', ') }}
+        success_msg: "managed_env_vars values are valid scalar literals"
+
+    - name: Preflight | verify managed profile path
+      ansible.builtin.assert:
+        that:
+          - managed_env_profile_path is match('^/etc/profile\\.d/[A-Za-z0-9_.-]+\\.sh$')
+        fail_msg: "managed_env_profile_path must match ^/etc/profile\\.d/[A-Za-z0-9_.-]+\\.sh$"
+        success_msg: "managed_env_profile_path is valid"
+
+    - name: Preflight | verify managed shell startup files
+      ansible.builtin.assert:
+        that:
+          - managed_env_shell_startup_files is sequence
+          - managed_env_shell_startup_files is not string
+          - managed_env_startup_invalid_files | length == 0
+        fail_msg: "managed_env_shell_startup_files must be a list containing only /etc/bash.bashrc and/or /etc/zsh/zshrc"
+        success_msg: "managed_env_shell_startup_files is valid"
+
+    - name: Preflight | inspect managed environment target
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ managed_env_profile_path | quote }}
+        echo "managed_env_profile_path=$dest"
+        if [ -e "$dest" ]; then
+          if [ -f "$dest" ]; then
+            if grep -Fqx '# Ansible managed: system environment variables' "$dest"; then
+              echo "OK: existing managed profile can be updated: $dest"
+            else
+              echo "FAIL: existing profile is not managed by this playbook: $dest"
+              exit 22
+            fi
+          else
+            echo "FAIL: managed profile path exists but is not a regular file: $dest"
+            exit 23
+          fi
+        else
+          echo "OK: managed profile will be created if execution is enabled: $dest"
+        fi
+
+        parent=$(dirname "$dest")
+        if [ ! -d "$parent" ]; then
+          echo "FAIL: parent directory does not exist: $parent"
+          exit 24
+        fi
+
+        echo "managed_env_execute={{ managed_env_execute }}"
+        echo "managed_env_manage_shell_startup={{ managed_env_manage_shell_startup }}"
+      register: managed_env_preflight_result
+      changed_when: false
+      failed_when: managed_env_preflight_result.rc != 0
+
+    - name: Show managed environment preflight result
+      ansible.builtin.debug:
+        var: managed_env_preflight_result.stdout_lines
+
+    - name: Preview | show managed environment plan
+      ansible.builtin.raw: |
+        set -eu
+
+        echo "managed_env_execute={{ managed_env_execute }}"
+        echo "managed_env_profile_path={{ managed_env_profile_path }}"
+        echo "managed_env_manage_shell_startup={{ managed_env_manage_shell_startup }}"
+        echo "managed_env_shell_startup_files={{ managed_env_shell_startup_files | join(',') }}"
+        echo "managed_env_var_count={{ managed_env_sorted_items | length }}"
+        echo "Managed environment variable plan:"
+        {% for item in managed_env_sorted_items %}
+        echo {{ (item.key ~ '=' ~ (item.value | string)) | quote }}
+        {% endfor %}
+        echo "No managed environment profile or shell startup files will be written unless managed_env_execute=true."
+      register: managed_env_preview_result
+      changed_when: false
+      failed_when: managed_env_preview_result.rc != 0
+
+    - name: Show managed environment preview result
+      ansible.builtin.debug:
+        var: managed_env_preview_result.stdout_lines
+
+    - name: Safety | explain dry-run mode
+      ansible.builtin.raw: |
+        echo "No changes performed. Re-run with -e managed_env_execute=true to write {{ managed_env_profile_path }} and update enabled shell startup files."
+      register: managed_env_safety_result
+      changed_when: false
+      failed_when: false
+      when: not (managed_env_execute | bool)
+
+    - name: Show managed environment safety result
+      ansible.builtin.debug:
+        var: managed_env_safety_result.stdout_lines
+      when: not (managed_env_execute | bool)
+
+    - name: Setup | write managed environment profile
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ managed_env_profile_path | quote }}
+        tmp="/tmp/ansible-managed-env-profile.$$"
+        trap 'rm -f "$tmp"' EXIT HUP INT TERM
+
+        parent=$(dirname "$dest")
+        if [ ! -d "$parent" ]; then
+          echo "FAIL: parent directory does not exist: $parent"
+          exit 21
+        fi
+
+        if [ -e "$dest" ]; then
+          if [ ! -f "$dest" ]; then
+            echo "FAIL: managed profile path exists but is not a regular file: $dest"
+            exit 22
+          fi
+          if ! grep -Fqx '# Ansible managed: system environment variables' "$dest"; then
+            echo "FAIL: existing profile is not managed by this playbook: $dest"
+            exit 23
+          fi
+        fi
+
+        cat > "$tmp" <<'MANAGED_ENV_PROFILE_EOF'
+        # Ansible managed: system environment variables
+        # Source of truth: managed_env_vars
+        # Scope: new login/interactive shells that source this file
+        {% for item in managed_env_sorted_items %}
+        export {{ item.key }}='{{ item.value | string | replace(managed_env_single_quote, managed_env_single_quote_escape) }}'
+        {% endfor %}
+        MANAGED_ENV_PROFILE_EOF
+
+        /bin/sh -n "$tmp"
+
+        if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
+          echo "OK: managed environment profile already current at $dest"
+          exit 0
+        fi
+
+        cp "$tmp" "$dest"
+        chown root:root "$dest"
+        chmod 0644 "$dest"
+        echo "CHANGED: wrote managed environment profile to $dest"
+      register: managed_env_apply_result
+      changed_when: "'CHANGED:' in managed_env_apply_result.stdout"
+      failed_when: managed_env_apply_result.rc != 0
+      when: managed_env_execute | bool
+
+    - name: Show managed environment apply result
+      ansible.builtin.debug:
+        var: managed_env_apply_result.stdout_lines
+      when: managed_env_execute | bool
+
+    - name: Setup | ensure shell startup files source managed environment profile
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        begin_marker="# BEGIN ANSIBLE MANAGED BLOCK: managed environment variables"
+        end_marker="# END ANSIBLE MANAGED BLOCK: managed environment variables"
+        profile_path={{ managed_env_profile_path | quote }}
+        tmp_dir="/tmp/ansible-managed-env-rc.$$"
+        mkdir -p "$tmp_dir"
+        trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+
+        block_file="$tmp_dir/block"
+        cat > "$block_file" <<MANAGED_ENV_RC_BLOCK_EOF
+        # BEGIN ANSIBLE MANAGED BLOCK: managed environment variables
+        if [ -r $profile_path ]; then
+          . $profile_path
+        fi
+        # END ANSIBLE MANAGED BLOCK: managed environment variables
+        MANAGED_ENV_RC_BLOCK_EOF
+
+        manage_rc_file() {
+          rc_file="$1"
+          case "$rc_file" in
+            /etc/bash.bashrc|/etc/zsh/zshrc) ;;
+            *)
+              echo "FAIL: shell startup file is not allowed: $rc_file"
+              return 30
+              ;;
+          esac
+
+          if [ ! -e "$rc_file" ]; then
+            echo "SKIP: shell startup file does not exist: $rc_file"
+            return 0
+          fi
+          if [ ! -f "$rc_file" ]; then
+            echo "FAIL: shell startup path exists but is not a regular file: $rc_file"
+            return 31
+          fi
+
+          rc_name=$(basename "$rc_file")
+          current_file="$tmp_dir/$rc_name.current"
+          candidate_file="$tmp_dir/$rc_name.candidate"
+          cp "$rc_file" "$current_file"
+
+          begin_count=$(grep -Fxc "$begin_marker" "$current_file" || true)
+          end_count=$(grep -Fxc "$end_marker" "$current_file" || true)
+
+          if [ "$begin_count" -eq 0 ] && [ "$end_count" -eq 0 ]; then
+            cat "$current_file" "$block_file" > "$candidate_file"
+          elif [ "$begin_count" -eq 1 ] && [ "$end_count" -eq 1 ]; then
+            awk -v begin="$begin_marker" -v end="$end_marker" -v block="$block_file" '
+              $0 == begin {
+                if (in_block) {
+                  bad = 1
+                  exit
+                }
+                while ((getline line < block) > 0) {
+                  print line
+                }
+                close(block)
+                in_block = 1
+                found = 1
+                next
+              }
+              $0 == end {
+                if (!in_block) {
+                  bad = 1
+                  exit
+                }
+                in_block = 0
+                next
+              }
+              !in_block { print }
+              END {
+                if (bad || in_block || !found) {
+                  exit 42
+                }
+              }
+            ' "$current_file" > "$candidate_file" || {
+              echo "FAIL: shell startup file has partial or invalid managed block: $rc_file"
+              return 32
+            }
+          else
+            echo "FAIL: shell startup file has partial or duplicate managed markers: $rc_file"
+            return 33
+          fi
+
+          if cmp -s "$candidate_file" "$rc_file"; then
+            echo "OK: shell startup file already sources managed environment profile: $rc_file"
+            return 0
+          fi
+
+          cp "$candidate_file" "$rc_file"
+          chown root:root "$rc_file"
+          chmod 0644 "$rc_file"
+          echo "CHANGED: ensured shell startup file sources managed environment profile: $rc_file"
+        }
+
+        {% for startup_file in managed_env_shell_startup_files %}
+        manage_rc_file {{ startup_file | quote }}
+        {% endfor %}
+      register: managed_env_startup_result
+      changed_when: "'CHANGED:' in managed_env_startup_result.stdout"
+      failed_when: managed_env_startup_result.rc != 0
+      when:
+        - managed_env_execute | bool
+        - managed_env_manage_shell_startup | bool
+
+    - name: Show managed environment shell startup result
+      ansible.builtin.debug:
+        var: managed_env_startup_result.stdout_lines
+      when:
+        - managed_env_execute | bool
+        - managed_env_manage_shell_startup | bool
+
+    - name: Verify | inspect managed environment profile and shell startup files
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ managed_env_profile_path | quote }}
+        echo "managed_env_profile_path=$dest"
+        if [ ! -f "$dest" ]; then
+          echo "FAIL: managed profile does not exist: $dest"
+          exit 40
+        fi
+        if [ ! -r "$dest" ]; then
+          echo "FAIL: managed profile is not readable: $dest"
+          exit 41
+        fi
+        /bin/sh -n "$dest"
+        mode=$(stat -c '%a' "$dest")
+        if [ "$mode" != "644" ]; then
+          echo "FAIL: managed profile mode is $mode, expected 644: $dest"
+          exit 42
+        fi
+        export_count=$(grep -c '^export [A-Za-z_][A-Za-z0-9_]*=' "$dest" || true)
+        if [ "$export_count" -ne {{ managed_env_sorted_items | length }} ]; then
+          echo "FAIL: managed profile export count is $export_count, expected {{ managed_env_sorted_items | length }}"
+          exit 43
+        fi
+        echo "OK: managed profile exists, is readable, has mode 0644, and contains $export_count managed exports"
+
+        if {{ 'true' if managed_env_manage_shell_startup | bool else 'false' }}; then
+          begin_marker="# BEGIN ANSIBLE MANAGED BLOCK: managed environment variables"
+          end_marker="# END ANSIBLE MANAGED BLOCK: managed environment variables"
+          check_rc_file() {
+            rc_file="$1"
+            case "$rc_file" in
+              /etc/bash.bashrc|/etc/zsh/zshrc) ;;
+              *)
+                echo "FAIL: shell startup file is not allowed: $rc_file"
+                return 50
+                ;;
+            esac
+
+            if [ ! -e "$rc_file" ]; then
+              echo "SKIP: shell startup file does not exist: $rc_file"
+              return 0
+            fi
+            if [ ! -f "$rc_file" ]; then
+              echo "FAIL: shell startup path exists but is not a regular file: $rc_file"
+              return 51
+            fi
+
+            begin_count=$(grep -Fxc "$begin_marker" "$rc_file" || true)
+            end_count=$(grep -Fxc "$end_marker" "$rc_file" || true)
+            if [ "$begin_count" -ne 1 ] || [ "$end_count" -ne 1 ]; then
+              echo "FAIL: shell startup file does not contain exactly one complete managed block: $rc_file"
+              return 52
+            fi
+            awk -v begin="$begin_marker" -v end="$end_marker" '
+              $0 == begin {
+                if (in_block) {
+                  bad = 1
+                  exit
+                }
+                in_block = 1
+                found = 1
+                next
+              }
+              $0 == end {
+                if (!in_block) {
+                  bad = 1
+                  exit
+                }
+                in_block = 0
+                next
+              }
+              END {
+                if (bad || in_block || !found) {
+                  exit 1
+                }
+              }
+            ' "$rc_file" || {
+              echo "FAIL: shell startup file has partial managed block: $rc_file"
+              return 53
+            }
+            echo "OK: shell startup file contains exactly one complete managed block: $rc_file"
+          }
+
+          {% for startup_file in managed_env_shell_startup_files %}
+          check_rc_file {{ startup_file | quote }}
+          {% endfor %}
+        else
+          echo "SKIP: managed_env_manage_shell_startup=false"
+        fi
+      register: managed_env_verify_result
+      changed_when: false
+      failed_when: managed_env_verify_result.rc != 0
+      when: managed_env_execute | bool
+
+    - name: Show managed environment verify result
+      ansible.builtin.debug:
+        var: managed_env_verify_result.stdout_lines
+      when: managed_env_execute | bool

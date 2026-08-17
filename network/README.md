@@ -23,3 +23,28 @@ ansible-playbook -i inventory.yml network/setup-system-proxy.yml --limit 10.10.1
 ```
 
 执行后，新开的 bash/zsh shell 会通过系统启动文件加载 proxy profile；当前 shell 需要手动 source 对应 profile 才会立即生效。
+
+## `setup-system-hosts.yml`
+
+管理系统 `/etc/hosts` 中一段固定 Ansible marker block，用于少数机器的快速 hosts 记录修改。默认只展示当前状态和计划，不写文件；长期、大批量域名管理仍应使用 DNS。
+
+这个 playbook 不接管整个 `/etc/hosts`，也不会自动修改 marker block 外的既有记录。如果计划写入的 IP 或 hostname 已经出现在非托管区域，preview/verify 会输出 `WARN`，但不会删除或改写那些行。
+
+主要变量：
+
+- `hosts_entries`：`hosts_state=present` 时必填，可传逗号分隔字符串或 YAML list；每个元素是一整行 `/etc/hosts` 记录，例如 `10.0.0.10 api.internal api,10.0.0.11 db.internal db`。
+- `hosts_state`：默认 `present`；设为 `absent` 时删除固定 marker block，且不要求传 `hosts_entries`。
+- `hosts_file_path`：默认 `/etc/hosts`。
+- `hosts_execute`：默认 `false`。设为 `true` 后才写入或删除 managed block。
+- `ansible_port`：默认 `36633`。
+
+建议先在单台 canary 节点运行 preview，确认 managed block 和重复记录警告符合预期后再执行：
+
+```bash
+ansible-playbook --syntax-check -i inventory.yml network/setup-system-hosts.yml
+ansible-playbook -i inventory.yml network/setup-system-hosts.yml --limit 10.10.10.111 -e '{"hosts_entries":"10.0.0.10 api.internal api,10.0.0.11 db.internal db"}'
+ansible-playbook -i inventory.yml network/setup-system-hosts.yml --limit 10.10.10.111 -e '{"hosts_entries":"10.0.0.10 api.internal api,10.0.0.11 db.internal db","hosts_execute":true}'
+ansible-playbook -i inventory.yml network/setup-system-hosts.yml --limit 10.10.10.111 -e '{"hosts_state":"absent","hosts_execute":true}'
+```
+
+在 Semaphore 中运行时，将 `hosts_entries`、`hosts_state`、`hosts_file_path` 和 `hosts_execute` 放到 Extra Variables；第一次模板运行建议设置 `limit` 为单台 canary 节点。

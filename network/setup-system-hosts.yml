@@ -1,0 +1,386 @@
+---
+- name: Setup system hosts entries
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    ansible_port: 36633
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_become_user: root
+    hosts_execute: false
+    hosts_file_path: /etc/hosts
+    hosts_state: present
+    hosts_entries: []
+    hosts_entry_items: >-
+      {{
+        (hosts_entries | split(',') | map('trim') | reject('equalto', '') | list)
+        if hosts_entries is string
+        else hosts_entries
+      }}
+    hosts_probe_name: >-
+      {{
+        hosts_entry_items[0].split()[1]
+        if hosts_state == 'present' and (hosts_entry_items | length > 0)
+        else ''
+      }}
+
+  tasks:
+    - name: Preflight | verify hosts_state is valid
+      ansible.builtin.assert:
+        that:
+          - hosts_state in ['present', 'absent']
+        fail_msg: "hosts_state must be present or absent."
+        success_msg: "hosts_state is valid"
+
+    - name: Preflight | verify hosts_entries shape
+      ansible.builtin.assert:
+        that:
+          - hosts_entries is string or (hosts_entries is sequence and hosts_entries is not string and hosts_entries is not mapping)
+          - hosts_entry_items | select('string') | list | length == hosts_entry_items | length
+        fail_msg: "hosts_entries must be a comma-separated string or YAML list of complete /etc/hosts lines."
+        success_msg: "hosts_entries shape is valid"
+
+    - name: Preflight | verify hosts_entries is provided for present state
+      ansible.builtin.assert:
+        that:
+          - hosts_state != 'present' or hosts_entry_items | length > 0
+        fail_msg: "hosts_entries is required when hosts_state=present. Example: -e 'hosts_entries=10.0.0.10 api.internal api'"
+        success_msg: "hosts_entries is valid for hosts_state"
+
+    - name: Preflight | inspect current hosts file and validate entries
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ hosts_file_path | quote }}
+        state={{ hosts_state | quote }}
+        begin_marker='# BEGIN ANSIBLE MANAGED BLOCK: hosts entries'
+        end_marker='# END ANSIBLE MANAGED BLOCK: hosts entries'
+        tmp_dir="/tmp/ansible-hosts-preflight.$$"
+        mkdir -p "$tmp_dir"
+        trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+
+        entries_file="$tmp_dir/entries"
+        stripped_file="$tmp_dir/stripped"
+        : > "$entries_file"
+        {% for entry in hosts_entry_items %}
+        printf '%s\n' {{ entry | quote }} >> "$entries_file"
+        {% endfor %}
+
+        echo "hosts_execute={{ hosts_execute }}"
+        echo "hosts_file_path=$dest"
+        echo "hosts_state=$state"
+        echo
+
+        parent=$(dirname "$dest")
+        if [ ! -d "$parent" ]; then
+          echo "FAIL: parent directory does not exist: $parent"
+          exit 21
+        fi
+        if [ -e "$dest" ] && [ ! -f "$dest" ]; then
+          echo "FAIL: hosts file path exists but is not a regular file: $dest"
+          exit 22
+        fi
+
+        if [ "$state" = "present" ]; then
+          line_no=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            line_no=$((line_no + 1))
+            if [ -z "$line" ]; then
+              echo "FAIL: hosts_entries line $line_no must not be empty"
+              exit 30
+            fi
+            if printf '%s' "$line" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+              echo "FAIL: hosts_entries line $line_no contains control characters"
+              exit 31
+            fi
+            case "$line" in
+              *'#'*)
+                echo "FAIL: hosts_entries line $line_no must not contain comments or # characters"
+                exit 32
+                ;;
+            esac
+
+            set -- $line
+            if [ "$#" -lt 2 ]; then
+              echo "FAIL: hosts_entries line $line_no must have at least IP/host and one hostname"
+              exit 33
+            fi
+
+            address=$1
+            if ! printf '%s\n' "$address" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]+$|^[A-Za-z0-9._-]+$'; then
+              echo "FAIL: hosts_entries line $line_no has invalid first field: $address"
+              exit 34
+            fi
+
+            shift
+            for host_name in "$@"; do
+              case "$host_name" in
+                *[!A-Za-z0-9._-]*|'')
+                  echo "FAIL: hosts_entries line $line_no has invalid hostname or alias: $host_name"
+                  exit 35
+                  ;;
+              esac
+            done
+          done < "$entries_file"
+        fi
+
+        if [ -f "$dest" ]; then
+          begin_count=$(grep -Fxc "$begin_marker" "$dest" || true)
+          end_count=$(grep -Fxc "$end_marker" "$dest" || true)
+          if [ "$begin_count" -ne "$end_count" ]; then
+            echo "FAIL: managed hosts marker count mismatch in $dest"
+            echo "begin_marker_count=$begin_count"
+            echo "end_marker_count=$end_count"
+            exit 40
+          fi
+          if [ "$begin_count" -gt 1 ]; then
+            echo "FAIL: multiple managed hosts blocks found in $dest"
+            exit 41
+          fi
+
+          echo "Current managed hosts block:"
+          awk -v begin="$begin_marker" -v end="$end_marker" '
+            $0 == begin { in_block = 1 }
+            in_block { print }
+            $0 == end { in_block = 0 }
+          ' "$dest"
+          echo
+
+          awk -v begin="$begin_marker" -v end="$end_marker" '
+            $0 == begin { skip = 1; next }
+            $0 == end { skip = 0; next }
+            !skip { print }
+          ' "$dest" > "$stripped_file"
+
+          if [ "$state" = "present" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              set -- $line
+              address=$1
+              if awk -v needle="$address" 'NF > 0 && $1 == needle { found = 1 } END { exit found ? 0 : 1 }' "$stripped_file"; then
+                echo "WARN: address already appears outside managed block: $address"
+              fi
+              shift
+              for host_name in "$@"; do
+                if awk -v needle="$host_name" '
+                  NF > 1 {
+                    for (i = 2; i <= NF; i++) {
+                      if ($i == needle) { found = 1 }
+                    }
+                  }
+                  END { exit found ? 0 : 1 }
+                ' "$stripped_file"; then
+                  echo "WARN: hostname already appears outside managed block: $host_name"
+                fi
+              done
+            done < "$entries_file"
+          fi
+        else
+          echo "Current $dest does not exist and will be created when hosts_execute=true."
+        fi
+      register: hosts_preflight_result
+      changed_when: false
+      failed_when: hosts_preflight_result.rc != 0
+
+    - name: Show hosts preflight result
+      ansible.builtin.debug:
+        var: hosts_preflight_result.stdout_lines
+
+    - name: Preview | show hosts block plan
+      ansible.builtin.raw: |
+        set -eu
+
+        state={{ hosts_state | quote }}
+        echo "hosts_execute={{ hosts_execute }}"
+        echo "hosts_file_path={{ hosts_file_path }}"
+        echo "hosts_state=$state"
+        echo
+
+        if [ "$state" = "present" ]; then
+          echo "Managed hosts block to enforce:"
+          echo '# BEGIN ANSIBLE MANAGED BLOCK: hosts entries'
+          {% for entry in hosts_entry_items %}
+          printf '%s\n' {{ entry | quote }}
+          {% endfor %}
+          echo '# END ANSIBLE MANAGED BLOCK: hosts entries'
+        else
+          echo "Managed hosts block will be removed if it exists."
+        fi
+        echo
+        echo "No hosts file changes will be written unless hosts_execute=true."
+      register: hosts_preview_result
+      changed_when: false
+      failed_when: hosts_preview_result.rc != 0
+
+    - name: Show hosts preview result
+      ansible.builtin.debug:
+        var: hosts_preview_result.stdout_lines
+
+    - name: Safety | explain dry-run mode
+      ansible.builtin.raw: |
+        echo "No changes performed. Re-run with -e hosts_execute=true to update {{ hosts_file_path }}."
+      register: hosts_safety_result
+      changed_when: false
+      failed_when: false
+      when: not (hosts_execute | bool)
+
+    - name: Show hosts safety result
+      ansible.builtin.debug:
+        var: hosts_safety_result.stdout_lines
+      when: not (hosts_execute | bool)
+
+    - name: Setup | apply managed hosts block
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ hosts_file_path | quote }}
+        state={{ hosts_state | quote }}
+        begin_marker='# BEGIN ANSIBLE MANAGED BLOCK: hosts entries'
+        end_marker='# END ANSIBLE MANAGED BLOCK: hosts entries'
+        tmp_dir="/tmp/ansible-hosts-apply.$$"
+        backup="${dest}.ansible.$(date +%Y%m%d%H%M%S).bak"
+        mkdir -p "$tmp_dir"
+        trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+
+        current_file="$tmp_dir/current"
+        stripped_file="$tmp_dir/stripped"
+        block_file="$tmp_dir/block"
+        candidate_file="$tmp_dir/candidate"
+
+        parent=$(dirname "$dest")
+        if [ ! -d "$parent" ]; then
+          echo "FAIL: parent directory does not exist: $parent"
+          exit 21
+        fi
+        if [ -e "$dest" ] && [ ! -f "$dest" ]; then
+          echo "FAIL: hosts file path exists but is not a regular file: $dest"
+          exit 22
+        fi
+
+        if [ -f "$dest" ]; then
+          cp "$dest" "$current_file"
+        else
+          : > "$current_file"
+        fi
+
+        begin_count=$(grep -Fxc "$begin_marker" "$current_file" || true)
+        end_count=$(grep -Fxc "$end_marker" "$current_file" || true)
+        if [ "$begin_count" -ne "$end_count" ]; then
+          echo "FAIL: managed hosts marker count mismatch in $dest"
+          echo "begin_marker_count=$begin_count"
+          echo "end_marker_count=$end_count"
+          exit 40
+        fi
+        if [ "$begin_count" -gt 1 ]; then
+          echo "FAIL: multiple managed hosts blocks found in $dest"
+          exit 41
+        fi
+
+        awk -v begin="$begin_marker" -v end="$end_marker" '
+          $0 == begin { skip = 1; next }
+          $0 == end { skip = 0; next }
+          !skip { print }
+        ' "$current_file" > "$stripped_file"
+
+        if [ "$state" = "present" ]; then
+          {
+            echo '# BEGIN ANSIBLE MANAGED BLOCK: hosts entries'
+            {% for entry in hosts_entry_items %}
+            printf '%s\n' {{ entry | quote }}
+            {% endfor %}
+            echo '# END ANSIBLE MANAGED BLOCK: hosts entries'
+          } > "$block_file"
+
+          cat "$stripped_file" "$block_file" > "$candidate_file"
+        else
+          cp "$stripped_file" "$candidate_file"
+        fi
+
+        if cmp -s "$candidate_file" "$current_file"; then
+          echo "OK: hosts file already matches requested managed block state at $dest"
+          exit 0
+        fi
+
+        if [ -f "$dest" ]; then
+          cp "$dest" "$backup"
+          echo "Backup: $backup"
+        fi
+
+        cp "$candidate_file" "$dest"
+        chown root:root "$dest"
+        chmod 0644 "$dest"
+        echo "CHANGED: updated managed hosts block at $dest"
+      register: hosts_apply_result
+      changed_when: "'CHANGED:' in hosts_apply_result.stdout"
+      failed_when: hosts_apply_result.rc != 0
+      when: hosts_execute | bool
+
+    - name: Show hosts setup result
+      ansible.builtin.debug:
+        var: hosts_apply_result.stdout_lines
+      when: hosts_execute | bool
+
+    - name: Verify | show managed hosts block and probe first hostname
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ hosts_file_path | quote }}
+        state={{ hosts_state | quote }}
+        begin_marker='# BEGIN ANSIBLE MANAGED BLOCK: hosts entries'
+        end_marker='# END ANSIBLE MANAGED BLOCK: hosts entries'
+        probe_name={{ hosts_probe_name | quote }}
+
+        if [ ! -f "$dest" ]; then
+          echo "FAIL: hosts file does not exist: $dest"
+          exit 50
+        fi
+
+        begin_count=$(grep -Fxc "$begin_marker" "$dest" || true)
+        end_count=$(grep -Fxc "$end_marker" "$dest" || true)
+        if [ "$begin_count" -ne "$end_count" ]; then
+          echo "FAIL: managed hosts marker count mismatch in $dest"
+          echo "begin_marker_count=$begin_count"
+          echo "end_marker_count=$end_count"
+          exit 51
+        fi
+
+        if [ "$state" = "absent" ]; then
+          if [ "$begin_count" -ne 0 ]; then
+            echo "FAIL: managed hosts block still exists in $dest"
+            exit 52
+          fi
+          echo "OK: managed hosts block is absent from $dest"
+          exit 0
+        fi
+
+        if [ "$begin_count" -ne 1 ]; then
+          echo "FAIL: managed hosts block was not found in $dest"
+          exit 53
+        fi
+
+        echo "Current managed hosts block:"
+        awk -v begin="$begin_marker" -v end="$end_marker" '
+          $0 == begin { in_block = 1 }
+          in_block { print }
+          $0 == end { in_block = 0 }
+        ' "$dest"
+        echo
+
+        if [ "$dest" = "/etc/hosts" ]; then
+          echo "Hosts probe for $probe_name:"
+          getent hosts "$probe_name"
+        else
+          echo "SKIP: getent probe only checks the system hosts database, not custom hosts_file_path=$dest"
+        fi
+      register: hosts_verify_result
+      changed_when: false
+      failed_when: hosts_verify_result.rc != 0
+      when: hosts_execute | bool
+
+    - name: Show hosts verify result
+      ansible.builtin.debug:
+        var: hosts_verify_result.stdout_lines
+      when: hosts_execute | bool

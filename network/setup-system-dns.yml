@@ -1,0 +1,330 @@
+---
+- name: Setup system DNS resolver
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    ansible_port: 36633
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_become_user: root
+    dns_execute: false
+    dns_resolv_conf_path: /etc/resolv.conf
+    dns_nameservers: []
+    dns_search_domains: []
+    dns_options: []
+    dns_probe_domain: example.com
+    dns_nameserver_items: >-
+      {{
+        (dns_nameservers | split(',') | map('trim') | reject('equalto', '') | list)
+        if dns_nameservers is string
+        else dns_nameservers
+      }}
+    dns_search_domain_items: >-
+      {{
+        (dns_search_domains | split(',') | map('trim') | reject('equalto', '') | list)
+        if dns_search_domains is string
+        else dns_search_domains
+      }}
+    dns_option_items: >-
+      {{
+        (dns_options | split(',') | map('trim') | reject('equalto', '') | list)
+        if dns_options is string
+        else dns_options
+      }}
+    dns_invalid_nameserver_items: >-
+      {{
+        dns_nameserver_items
+        | reject('match', '\A(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*)\Z')
+        | list
+      }}
+    dns_invalid_search_domain_items: >-
+      {{
+        dns_search_domain_items
+        | reject('match', '\A([A-Za-z0-9_][A-Za-z0-9_-]*\.)*[A-Za-z0-9_][A-Za-z0-9_-]*\.?\Z')
+        | list
+      }}
+    dns_invalid_option_items: >-
+      {{
+        dns_option_items
+        | reject('match', '\A[A-Za-z0-9_-]+(:[A-Za-z0-9_.-]+)?\Z')
+        | list
+      }}
+    dns_probe_domain_invalid: >-
+      {{
+        dns_probe_domain is not string
+        or not (dns_probe_domain is match('\A([A-Za-z0-9_][A-Za-z0-9_-]*\.)*[A-Za-z0-9_][A-Za-z0-9_-]*\.?\Z'))
+      }}
+
+  tasks:
+    - name: Preflight | verify dns_nameservers is provided
+      ansible.builtin.assert:
+        that:
+          - dns_nameserver_items | length > 0
+        fail_msg: "dns_nameservers is required. Example: -e dns_nameservers=10.0.0.2,10.0.0.3"
+        success_msg: "dns_nameservers is provided"
+
+    - name: Preflight | verify DNS variables are strings or lists
+      ansible.builtin.assert:
+        that:
+          - dns_nameservers is string or (dns_nameservers is sequence and dns_nameservers is not string and dns_nameservers is not mapping)
+          - dns_search_domains is string or (dns_search_domains is sequence and dns_search_domains is not string and dns_search_domains is not mapping)
+          - dns_options is string or (dns_options is sequence and dns_options is not string and dns_options is not mapping)
+          - dns_nameserver_items | select('string') | list | length == dns_nameserver_items | length
+          - dns_search_domain_items | select('string') | list | length == dns_search_domain_items | length
+          - dns_option_items | select('string') | list | length == dns_option_items | length
+        fail_msg: "dns_nameservers, dns_search_domains, and dns_options must be comma-separated strings or YAML lists of strings."
+        success_msg: "DNS variable shapes are valid"
+
+    - name: Preflight | verify DNS values are resolver-safe tokens
+      ansible.builtin.assert:
+        that:
+          - dns_invalid_nameserver_items | length == 0
+          - dns_invalid_search_domain_items | length == 0
+          - dns_invalid_option_items | length == 0
+          - not dns_probe_domain_invalid
+        fail_msg:
+          - "dns_nameservers must contain only IPv4 or IPv6 literals. Invalid: {{ dns_invalid_nameserver_items | join(',') }}"
+          - "dns_search_domains may contain only resolver-safe domain tokens. Invalid: {{ dns_invalid_search_domain_items | join(',') }}"
+          - "dns_options may contain only resolver-safe option tokens. Invalid: {{ dns_invalid_option_items | join(',') }}"
+          - "dns_probe_domain must be a resolver-safe domain token. Current: {{ dns_probe_domain }}"
+        success_msg: "DNS values are resolver-safe tokens"
+
+    - name: Preflight | verify resolver path is fixed
+      ansible.builtin.assert:
+        that:
+          - dns_resolv_conf_path == '/etc/resolv.conf'
+        fail_msg: "dns_resolv_conf_path is fixed to /etc/resolv.conf for safety. Use a dedicated playbook for other resolver managers or paths."
+        success_msg: "dns_resolv_conf_path is fixed to /etc/resolv.conf"
+
+    - name: Preflight | inspect current resolver file
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ dns_resolv_conf_path | quote }}
+        tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ansible-dns-preflight.XXXXXX")
+        trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+        nameservers_file="$tmp_dir/nameservers"
+        search_domains_file="$tmp_dir/search_domains"
+        options_file="$tmp_dir/options"
+        : > "$nameservers_file"
+        : > "$search_domains_file"
+        : > "$options_file"
+        {% for nameserver in dns_nameserver_items %}
+        printf '%s\n' {{ nameserver | quote }} >> "$nameservers_file"
+        {% endfor %}
+        {% for domain in dns_search_domain_items %}
+        printf '%s\n' {{ domain | quote }} >> "$search_domains_file"
+        {% endfor %}
+        {% for option in dns_option_items %}
+        printf '%s\n' {{ option | quote }} >> "$options_file"
+        {% endfor %}
+
+        fail_value() {
+          echo "FAIL: $1"
+          exit "$2"
+        }
+
+        verify_basic_token() {
+          kind=$1
+          value=$2
+          code=$3
+          if [ -z "$value" ]; then
+            fail_value "$kind must not be empty" "$code"
+          fi
+          if printf '%s' "$value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+            fail_value "$kind contains control characters" "$code"
+          fi
+          case "$value" in
+            *'#'*) fail_value "$kind must not contain comments or # characters" "$code" ;;
+          esac
+        }
+
+        verify_nameserver() {
+          value=$1
+          verify_basic_token "dns_nameservers item '$value'" "$value" 30
+          if printf '%s\n' "$value" | grep -Eq '^[0-9A-Fa-f:]*:[0-9A-Fa-f:]*$'; then
+            return 0
+          fi
+          if printf '%s\n' "$value" | awk -F. '
+            NF != 4 { exit 1 }
+            {
+              for (i = 1; i <= NF; i++) {
+                if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) { exit 1 }
+              }
+            }
+          '; then
+            return 0
+          fi
+          fail_value "dns_nameservers item '$value' must be an IPv4 or IPv6 literal" 31
+        }
+
+        verify_domain() {
+          value=$1
+          verify_basic_token "dns_search_domains item '$value'" "$value" 32
+          if ! printf '%s\n' "$value" | grep -Eq '^([A-Za-z0-9_][A-Za-z0-9_-]*\.)*[A-Za-z0-9_][A-Za-z0-9_-]*\.?$'; then
+            fail_value "dns_search_domains item '$value' has invalid resolver search domain characters" 33
+          fi
+        }
+
+        verify_option() {
+          value=$1
+          verify_basic_token "dns_options item '$value'" "$value" 34
+          if ! printf '%s\n' "$value" | grep -Eq '^[A-Za-z0-9_-]+(:[A-Za-z0-9_.-]+)?$'; then
+            fail_value "dns_options item '$value' has invalid resolver option characters" 35
+          fi
+        }
+
+        while IFS= read -r nameserver || [ -n "$nameserver" ]; do
+          verify_nameserver "$nameserver"
+        done < "$nameservers_file"
+
+        while IFS= read -r domain || [ -n "$domain" ]; do
+          verify_domain "$domain"
+        done < "$search_domains_file"
+
+        while IFS= read -r option || [ -n "$option" ]; do
+          verify_option "$option"
+        done < "$options_file"
+
+        echo "dns_execute={{ dns_execute | bool | ternary('true', 'false') }}"
+        echo "dns_resolv_conf_path=$dest"
+        echo
+
+        if [ -L "$dest" ]; then
+          echo "WARN: $dest is a symlink. This playbook intentionally manages only a plain resolv.conf file."
+          echo "Current link target: $(readlink "$dest")"
+          echo "Preview can continue, but execute mode will refuse to overwrite resolver manager controlled files."
+        elif [ -f "$dest" ]; then
+          echo "Current $dest:"
+          sed -n '1,120p' "$dest"
+        elif [ -e "$dest" ]; then
+          echo "FAIL: resolver file path exists but is not a regular file: $dest"
+          exit 36
+        else
+          echo "Current $dest does not exist and will be created when dns_execute=true."
+        fi
+      register: dns_preflight_result
+      changed_when: false
+      failed_when: dns_preflight_result.rc != 0
+
+    - name: Show resolver preflight result
+      ansible.builtin.debug:
+        var: dns_preflight_result.stdout_lines
+
+    - name: Preview | show DNS resolver plan
+      ansible.builtin.debug:
+        msg:
+          - "dns_execute={{ dns_execute }}"
+          - "dns_resolv_conf_path={{ dns_resolv_conf_path }}"
+          - "dns_nameservers={{ dns_nameserver_items | join(',') }}"
+          - "dns_search_domains={{ dns_search_domain_items | join(',') }}"
+          - "dns_options={{ dns_option_items | join(',') }}"
+          - "dns_probe_domain={{ dns_probe_domain }}"
+          - "No resolver file will be written unless dns_execute=true."
+
+    - name: Setup | write resolver file
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ dns_resolv_conf_path | quote }}
+        tmp=$(mktemp "${TMPDIR:-/tmp}/ansible-dns-resolv-conf.XXXXXX")
+        tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ansible-dns-write.XXXXXX")
+        backup="${dest}.ansible.$(date +%Y%m%d%H%M%S).bak"
+        trap 'rm -f "$tmp"; rm -rf "$tmp_dir"' EXIT HUP INT TERM
+        nameservers_file="$tmp_dir/nameservers"
+        search_domains_file="$tmp_dir/search_domains"
+        options_file="$tmp_dir/options"
+        : > "$nameservers_file"
+        : > "$search_domains_file"
+        : > "$options_file"
+        {% for nameserver in dns_nameserver_items %}
+        printf '%s\n' {{ nameserver | quote }} >> "$nameservers_file"
+        {% endfor %}
+        {% for domain in dns_search_domain_items %}
+        printf '%s\n' {{ domain | quote }} >> "$search_domains_file"
+        {% endfor %}
+        {% for option in dns_option_items %}
+        printf '%s\n' {{ option | quote }} >> "$options_file"
+        {% endfor %}
+
+        parent=$(dirname "$dest")
+        if [ ! -d "$parent" ]; then
+          echo "FAIL: parent directory does not exist: $parent"
+          exit 21
+        fi
+
+        if [ -L "$dest" ]; then
+          echo "FAIL: $dest is a symlink. Refusing to overwrite resolver manager controlled file."
+          echo "Current link target: $(readlink "$dest")"
+          exit 23
+        fi
+
+        if [ -e "$dest" ] && [ ! -f "$dest" ]; then
+          echo "FAIL: resolver file path exists but is not a regular file: $dest"
+          exit 24
+        fi
+
+        printf '%s\n' '# Managed by Ansible. Manual changes will be overwritten.' > "$tmp"
+        if [ -s "$search_domains_file" ]; then
+          printf '%s' 'search' >> "$tmp"
+          while IFS= read -r domain || [ -n "$domain" ]; do
+            printf ' %s' "$domain" >> "$tmp"
+          done < "$search_domains_file"
+          printf '\n' >> "$tmp"
+        fi
+        while IFS= read -r nameserver || [ -n "$nameserver" ]; do
+          printf 'nameserver %s\n' "$nameserver" >> "$tmp"
+        done < "$nameservers_file"
+        while IFS= read -r option || [ -n "$option" ]; do
+          printf 'options %s\n' "$option" >> "$tmp"
+        done < "$options_file"
+
+        if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
+          echo "OK: resolver file already current at $dest"
+          exit 0
+        fi
+
+        if [ -f "$dest" ]; then
+          cp "$dest" "$backup"
+          echo "Backup: $backup"
+        fi
+
+        cp "$tmp" "$dest"
+        chown root:root "$dest"
+        chmod 0644 "$dest"
+        echo "CHANGED: wrote resolver file to $dest"
+      register: dns_write_result
+      changed_when: "'CHANGED:' in dns_write_result.stdout"
+      failed_when: dns_write_result.rc != 0
+      when: dns_execute | bool
+
+    - name: Show setup result
+      ansible.builtin.debug:
+        var: dns_write_result.stdout_lines
+      when: dns_execute | bool
+
+    - name: Verify | show resolver file and probe DNS
+      become: true
+      ansible.builtin.raw: |
+        set -eu
+
+        dest={{ dns_resolv_conf_path | quote }}
+        probe_domain={{ dns_probe_domain | quote }}
+        echo "Current $dest:"
+        sed -n '1,120p' "$dest"
+        echo
+        echo "Resolver probe for $probe_domain:"
+        getent hosts "$probe_domain"
+      register: dns_verify_result
+      changed_when: false
+      failed_when: dns_verify_result.rc != 0
+      when: dns_execute | bool
+
+    - name: Show verify result
+      ansible.builtin.debug:
+        var: dns_verify_result.stdout_lines
+      when: dns_execute | bool

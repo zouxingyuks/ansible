@@ -24,6 +24,32 @@ ansible-playbook -i inventory.yml network/setup-system-proxy.yml --limit 10.10.1
 
 执行后，新开的 bash/zsh shell 会通过系统启动文件加载 proxy profile；当前 shell 需要手动 source 对应 profile 才会立即生效。
 
+## `setup-system-dns.yml`
+
+写入系统 `/etc/resolv.conf` DNS resolver 配置。默认只展示当前 resolver 文件和计划，不写文件。
+
+这个 playbook 只管理普通文件形式的 `/etc/resolv.conf`。如果目标节点的 `/etc/resolv.conf` 是指向 `systemd-resolved` 或 NetworkManager 管理路径的 symlink，preview 会打印警告，execute 会中止并提示使用对应管理器的专用方案，避免覆盖系统 DNS 管理链路。
+
+主要变量：
+
+- `dns_nameservers`：必填，可传逗号分隔字符串或 YAML list，例如 `10.0.0.2,10.0.0.3`；每一项必须是 IPv4 或 IPv6 字面量。
+- `dns_search_domains`：可选，可传逗号分隔字符串或 YAML list，例如 `example.internal,svc.cluster.local`；每一项只能包含 resolver search domain 安全字符。
+- `dns_options`：可选，可传逗号分隔字符串或 YAML list，例如 `timeout:2,attempts:2`；每一项只能包含 resolver option 安全字符。
+- `dns_probe_domain`：执行后用于 `getent hosts` 验证解析的域名，默认 `example.com`。
+- `dns_resolv_conf_path`：固定为 `/etc/resolv.conf`，为避免误写其他 root 文件，不支持通过 Extra Variables 改成其他路径。
+- `dns_execute`：默认 `false`。设为 `true` 后才备份并写入 resolver 文件。
+- `ansible_port`：默认 `36633`。
+
+建议先在单台 canary 节点运行 preview，确认目标节点不是 symlink 管理的 resolver 文件，且计划内容符合预期后再执行：
+
+```bash
+ansible-playbook --syntax-check -i inventory.yml network/setup-system-dns.yml
+ansible-playbook -i inventory.yml network/setup-system-dns.yml --limit 10.10.10.111 -e dns_nameservers=10.0.0.2,10.0.0.3 -e dns_search_domains=example.internal
+ansible-playbook -i inventory.yml network/setup-system-dns.yml --limit 10.10.10.111 -e dns_nameservers=10.0.0.2,10.0.0.3 -e dns_search_domains=example.internal -e dns_execute=true
+```
+
+在 Semaphore 中运行时，将 `dns_nameservers`、`dns_search_domains`、`dns_options`、`dns_probe_domain` 和 `dns_execute` 放到 Extra Variables；第一次模板运行建议设置 `limit` 为单台 canary 节点。
+
 ## `setup-system-hosts.yml`
 
 管理系统 `/etc/hosts` 中一段固定 Ansible marker block，用于少数机器的快速 hosts 记录修改。默认只展示当前状态和计划，不写文件；长期、大批量域名管理仍应使用 DNS。
